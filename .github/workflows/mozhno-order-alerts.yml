@@ -1,0 +1,46 @@
+name: Mozhno order notifications
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/mozhno-order-alerts.yml']
+permissions: {}
+concurrency:
+  group: mozhno-order-notifications
+  cancel-in-progress: false
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Verify Telegram delivery
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.MOZHNO_TELEGRAM_BOT_TOKEN }}
+          PAIRING: ${{ secrets.MOZHNO_TELEGRAM_PAIRING }}
+        shell: python
+        run: |
+          import json, os, sys
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError
+          def telegram(method, data):
+              url = 'https://api.telegram.org/bot' + os.environ['TELEGRAM_TOKEN'] + '/' + method
+              req = Request(url, json.dumps(data).encode(), {'Content-Type': 'application/json'})
+              try:
+                  with urlopen(req, timeout=18) as response:
+                      return json.load(response)['result']
+              except HTTPError as exc:
+                  sys.exit(f'Telegram {method}: HTTP {exc.code}')
+          me = telegram('getMe', {})
+          if me['username'] != 'mozhno_kabinet_bot':
+              sys.exit('Unexpected bot identity')
+          print('Bot identity verified')
+          command = '/start ' + os.environ['PAIRING']
+          for update in telegram('getUpdates', {'timeout': 0}):
+              msg = update.get('message', {})
+              chat = msg.get('chat', {})
+              if chat.get('type') == 'private' and chat['id'] == msg.get('from', {}).get('id') and msg.get('text') == command:
+                  telegram('sendMessage', {'chat_id': chat['id'], 'text': 'Можно. Лана, это проверка связи с магазином. Личный чат для уведомлений найден.'})
+                  print('Private test message accepted by Telegram')
+                  break
+          else:
+              sys.exit('Pairing message not available')
