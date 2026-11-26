@@ -1,5 +1,7 @@
 name: Mozhno order notifications
 on:
+  schedule:
+    - cron: '2-59/5 * * * *'
   workflow_dispatch:
   push:
     branches: [main]
@@ -13,9 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Verify Telegram delivery
+      - name: Deliver paid orders
         env:
           TELEGRAM_TOKEN: ${{ secrets.MOZHNO_TELEGRAM_BOT_TOKEN }}
+          SIGNING_KEY: ${{ secrets.MOZHNO_NOTIFY_SIGNING_KEY }}
           PAIRING: ${{ secrets.MOZHNO_TELEGRAM_PAIRING }}
         shell: python
         run: |
@@ -34,13 +37,37 @@ jobs:
           if me['username'] != 'mozhno_kabinet_bot':
               sys.exit('Unexpected bot identity')
           print('Bot identity verified')
-          command = '/start ' + os.environ['PAIRING']
-          for update in telegram('getUpdates', {'timeout': 0}):
-              msg = update.get('message', {})
-              chat = msg.get('chat', {})
-              if chat.get('type') == 'private' and chat['id'] == msg.get('from', {}).get('id') and msg.get('text') == command:
-                  telegram('sendMessage', {'chat_id': chat['id'], 'text': 'Можно. Лана, это проверка связи с магазином. Личный чат для уведомлений найден.'})
-                  print('Private test message accepted by Telegram')
-                  break
-          else:
-              sys.exit('Pairing message not available')
+          import base64, subprocess, tempfile, time
+          def shop(action, **values):
+              payload = json.dumps(dict(values, time=int(time.time()), action=action), separators=(',', ':')).encode()
+              with tempfile.NamedTemporaryFile(mode='w') as key:
+                  key.write(os.environ['SIGNING_KEY'])
+                  key.flush()
+                  signature = subprocess.run(['openssl', 'dgst', '-sha256', '-sign', key.name], input=payload, stdout=subprocess.PIPE, check=True).stdout
+              request = Request('https://shop-mozhno.ru/merchant-telegram-dispatch.php', payload, {
+                  'Content-Type':'application/json', 'X-Mozhno-Signature':base64.b64encode(signature).decode()})
+              try:
+                  with urlopen(request, timeout=90) as response:
+                      return json.load(response)
+              except HTTPError as exc:
+                  sys.exit(f'Shop {action}: HTTP {exc.code}')
+          chat_id = shop('owner')['chat']
+          if not chat_id:
+              command = '/start ' + os.environ['PAIRING']
+              for update in telegram('getUpdates', {'timeout': 0, 'limit': 100}):
+                  msg = update.get('message', {})
+                  chat = msg.get('chat', {})
+                  if chat.get('type') == 'private' and chat['id'] == msg.get('from', {}).get('id') and msg.get('text','').strip() == command:
+                      chat_id = str(chat['id'])
+                      telegram('sendMessage', {'chat_id':chat_id,'text':'Можно. Это проверка связи с магазином. Уведомления об оплатах придут в этот личный чат.'})
+                      shop('bind', chat=chat_id)
+                      print('Private chat paired and test accepted')
+                      break
+              if not chat_id:
+                  print('Waiting for private pairing command')
+                  sys.exit(0)
+          orders = shop('orders', chat=chat_id)['orders']
+          for order in orders:
+              sent = telegram('sendMessage', {'chat_id':chat_id, 'text':order['text'], 'protect_content':True})
+              shop('ack', chat=chat_id, payment=order['payment'], message=str(sent['message_id']))
+          print(f'Delivery acknowledged for {len(orders)} orders')
